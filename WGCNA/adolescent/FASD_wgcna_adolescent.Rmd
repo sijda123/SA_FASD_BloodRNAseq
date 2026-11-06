@@ -1,0 +1,2077 @@
+---
+title: "FASD_wgcna_adolescent"
+author: "Sijda Ahmed"
+output: html_document
+---
+
+# Description: 
+# Observations: 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Install the neccessary packages
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install("pasilla")
+
+if (!("DESeq2" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("DESeq2", update = FALSE)
+}
+
+if (!("impute" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("impute")
+}
+
+install.packages("GO.db")
+BiocManager::install("GO.db")
+BiocManager::install("preprocessCore")
+
+if (!("WGCNA" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  install.packages("WGCNA")
+}
+if (!("ggforce" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  install.packages("ggforce")
+}
+
+if (!("ComplexHeatmap" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  install.packages("ComplexHeatmap")
+}
+
+# used to install import so I can read in the gtf annotation file
+BiocManager::install("rtracklayer")
+library(rtracklayer)
+
+install.packages("dplyr")
+
+# for gene ontology
+if (!requireNamespace("enrichR", quietly = TRUE)) {
+    install.packages("enrichR")
+}
+install.packages("enrichR")
+
+BiocManager::install("clusterProfiler")
+
+if(!"RCy3" %in% installed.packages()){
+    install.packages("BiocManager")
+    BiocManager::install("RCy3")
+}
+
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+    BiocManager::install("org.Hs.eg.db")
+}
+
+```
+
+# Load in the packages
+```{r}
+library(BiocManager)
+library(pasilla)
+library(purrr)
+library(broom)
+library(patchwork)
+library(DESeq2)
+library(impute)
+library(WGCNA)
+library(ggforce)
+library(tidyverse)
+library(biomaRt)
+library(rtracklayer)
+library(dplyr)
+library(enrichR)
+library(plyr)
+library(glmnet)
+library(kableExtra)
+library(gt)
+library(RCy3)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(stringr)
+library(ggplot2)
+
+```
+
+# Loading in the count matrix and column data
+```{r}
+# cts is the gene count data for the samples
+cts <- readRDS("../cts_adolescent.rds")
+
+# Column data includes the alcohol exposure variables and covariates
+coldata <- readRDS("../coldata_adolescent.rds")
+
+```
+
+# Dropping id 131 because it doesn't have a RIN score and ids 2 and 197 for other reasons
+```{r}
+detach("package:dplyr", unload = TRUE)
+library(dplyr)
+
+cts <- cts |> select(-`131`, -`2`, -`197`)
+coldata <- coldata[!(rownames(coldata) %in% c("131", "2", "197")), ]
+
+```
+
+# Double checking row names of coldata match column names of cts
+```{r}
+ncol(cts)
+nrow(coldata)
+all(rownames(coldata) == colnames(cts))
+# 144 samples
+
+```
+
+# Differential gene expression analysis for maternal alcohol exposure (crude model)
+```{r}
+# Check the data types
+sapply(coldata, class)
+
+# Deseq
+dds <- DESeqDataSetFromMatrix(countData = cts,
+                              colData = coldata,
+                              design = ~ heavyExpYN)
+dds #63677 genes
+
+# Variables Used
+# heavyExpYN : heavy exposure binary variable (Yes = 1, No = 0)
+# lgaadxp : average daily ounces prenatal absolute alcohol +1
+# aaddxp : average ounces prenatal absolute alcohol per drinking occasion
+# pregnancy_drinking_perc : percent of days on which mother drank alcohol prenatally
+# moage_t0 : maternal age
+# mograde :	maternal education (yrs completed)
+# ses :	Hollingshead score
+# cigpday :	number of cigarettes/day
+# potxp :	days/month marijuana use
+# gar2 : weeks gestation at delivery
+# sexr3 : sex
+# age2009clinic :	age at blood draw
+# tikxp :	days/month methamphetamine use (didn't use cause 0 or NA for all, also NaNs were appearing during variance partition which wasn't letting the code run)
+# RINe : RIN scores (higher RIN score means higher quality)
+# Cell types...
+
+```
+
+# Filtering: remove lowly expressed genes and subset to protein-coding genes
+```{r}
+txdb <- import("../../gencode.v46.annotation.gtf/gencode.v46.annotation.gtf", format="gtf")
+
+txdb_biotype<-unique(data.frame(GENEID=mcols(txdb)$gene_id,TXTYPE=mcols(txdb)$gene_type))
+# Remove version from geneid
+txdb_biotype$GENEID <- sub("\\..*", "", txdb_biotype$GENEID)
+txdb_dds<-txdb_biotype[txdb_biotype$GENEID%in%row.names(counts(dds)),] 
+
+# Label mRNA species
+txdb_dds<-txdb_dds%>%mutate(TXTYPE=factor(ifelse(TXTYPE=="protein_coding","protein_coding",ifelse(TXTYPE=="lncRNA","lncRNA",ifelse(TXTYPE=="processed_pseudogene","processed_pseudogene",ifelse(TXTYPE=="transcribed_unprocessed_pseudogene","transcribed_unprocessed_pseudogene",ifelse(TXTYPE=="unprocessed_pseudogene","unprocessed_pseudogene","other_RNA")))))))
+
+# Remove lowly expressed
+keep<-rowSums(counts(dds)) >= 5
+summary(keep) #44019 genes
+dds <- dds[keep,]
+keep <- rowSums(counts(dds) > 10) >= 0.5*(ncol(dds))
+summary(keep) #21898 genes
+dds<-dds[keep,]
+
+# Plot detected mRNA species captured in data
+txdb_dds_filter<-txdb_dds[txdb_dds$GENEID%in%row.names(counts(dds)),] 
+
+mRNA_profile<-ggplot(txdb_dds_filter, aes(reorder(TXTYPE,TXTYPE,function(x)-length(x))))+
+  geom_bar()+
+  theme_bw()+
+  theme(axis.title=element_blank(),
+    axis.text.x=element_text(angle=45,hjust=1,vjust=1))
+
+mRNA_profile
+
+# Observation: most genes are protein coding
+
+# Restrict data to protein-coding 
+coding <-txdb_dds$GENEID[txdb_dds$TXTYPE=="protein_coding"]
+dds <-dds[row.names(counts(dds)) %in% coding, ]
+nrow(dds) #13515
+
+```
+
+# Gene annotation
+```{r}
+dds_ensembl<-gsub("\\..*", "", rownames(dds))
+
+#ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
+#mapping <- getBM(attributes=c("hgnc_symbol","ensembl_gene_id", "chromosome_name"), filters = "ensembl_gene_id", mart=ensembl, values=dds_ensembl)
+
+#gene_symbol_mapping<-mapping |>
+#  group_by(ensembl_gene_id) |>
+#  mutate(name_total=paste(hgnc_symbol,collapse=";")) |>
+#  mutate(name_total=na_if(name_total,""),
+#         name_total=ifelse(is.na(name_total),ensembl_gene_id,name_total)) |>
+#  distinct()
+
+mapping <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys = dds_ensembl,
+    keytype = "ENSEMBL",
+    columns = c("SYMBOL", "CHR")
+)
+colnames(mapping) <- c(
+    "ensembl_gene_id",
+    "hgnc_symbol",
+    "chromosome_name"
+)
+
+gene_symbol_mapping <- mapping |>
+  group_by(ensembl_gene_id) |>
+  summarise(
+    hgnc_symbol = paste(unique(na.omit(hgnc_symbol)), collapse = ";"),
+    chromosome_name = paste(unique(na.omit(chromosome_name)), collapse = ";"),
+    .groups = "drop"
+  ) |>
+  mutate(
+    hgnc_symbol = na_if(hgnc_symbol, ""),
+    hgnc_symbol = ifelse(is.na(hgnc_symbol), ensembl_gene_id, hgnc_symbol),
+    chromosome_name = na_if(chromosome_name, "")
+  )
+
+```
+
+# Remove sex-linked genes
+```{r}
+gene_symbol_mapping <- subset(gene_symbol_mapping, !grepl("X|Y", chromosome_name))
+dds <- dds[gene_symbol_mapping$ensembl_gene_id, ]
+nrow(dds) #13043
+
+```
+
+# Using DESeq
+```{r}
+# Female
+dds_female <- dds[, colData(dds)$sexr3 == 2]
+dds_female <- DESeq(dds_female)
+dds_female
+resultsNames(dds_female)
+
+# Male
+dds_male <- dds[, colData(dds)$sexr3 == 1]
+dds_male <- DESeq(dds_male)
+dds_male
+resultsNames(dds_male)
+
+# Overall
+dds <- DESeq(dds)
+dds
+resultsNames(dds)
+
+```
+
+# Normalization using vst
+```{r}
+dds_norm <- vst(dds)
+
+# Format normalized data for WGCNA
+normalized_counts <- assay(dds_norm) %>%
+  t() # Transpose this data
+
+# Save normalized_counts 
+write.csv(normalized_counts, file="wgcna_adolescent/normalized_counts.csv")
+
+```
+
+# Determine parameters for WGCNA
+```{r}
+# Identify good choices
+sft <- pickSoftThreshold(normalized_counts,
+  dataIsExpr = TRUE,
+  corFnc = cor,
+  corOptions = list(use = 'p'),
+  # do unsigned because we don't care if it's negatively or positively correlated
+  networkType = "unsigned"
+)
+
+# Calculate the measure of the model fit, unsigned R^2
+sft_df <- data.frame(sft$fitIndices) %>%
+  dplyr::mutate(model_fit = -sign(slope) * SFT.R.sq)
+
+# Plot the model fitting by the power soft threshold so we can decide on a soft-threshold
+ggplot(sft_df, aes(x = Power, y = model_fit, label = Power)) +
+  geom_point() +
+  geom_text(nudge_y = 0.1) +
+  # WGCNA recommends 0.8 as an R^2 cutoff
+  geom_hline(yintercept = 0.80, col = "blue") +
+  # We want to make sure we can still see the 0.80 level if values are low
+  ylim(c(min(sft_df$model_fit), 1.05)) +
+  xlab("Soft Threshold (power)") +
+  ylab("Scale Free Topology Model Fit, unsigned R^2") +
+  ggtitle("Scale independence") +
+  theme_classic()
+
+# Use a power where the signed R^2 values are around 0.8, >0.8 is okay too
+# I am using a power soft threshold of 7 (R^2 ~ 0.868)
+# Low R^2 values means there are too many lowly expressed genes in the data set
+
+```
+
+# Adjacency matrix and TOM
+```{r}
+softPower = 7
+adjacency = adjacency(normalized_counts, type='unsigned', power = softPower)
+
+TOM = TOMsimilarity(adjacency)
+dissTOM = 1-TOM
+
+geneTree = hclust(as.dist(dissTOM), method = "average")
+# Plot the resulting clustering tree (dendrogram)
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity",
+     labels = FALSE, hang = 0.04)
+
+```
+
+# Merge modules
+```{r}
+minModuleSize = 30; # Each module has at least 30 genes
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                deepSplit = 2, pamRespectsDendro = FALSE,
+                minClusterSize = minModuleSize);
+table(dynamicMods) # 32 modules (plus an unmapped genes module)
+
+```
+
+# Format colors
+```{r}
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Gene dendrogram and module colors")
+
+```
+
+# Extract eigengenes and merge similar modules
+```{r}
+# Calculate eigengenes
+MEList = moduleEigengenes(normalized_counts, colors = dynamicColors)
+MEs = MEList$eigengenes
+MEs=orderMEs(MEs)
+
+plotEigengeneNetworks(MEs, "Eigengene adjacency heatmap", marHeatmap = c(3,4,2,2),
+plotDendrograms = FALSE, xLabelsAngle = 90)
+
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs);
+# Cluster module eigengenes
+METree = hclust(as.dist(MEDiss), method = "average");
+# Plot the result
+sizeGrWindow(7, 6)
+plot(METree, main = "Clustering of module eigengenes",
+     xlab = "", sub = "")
+# Plot the cut line into the dendrogram at cut height = 0.25
+abline(h=0.25, col = "red")
+
+# Look at module correlations
+MEDissThres = c(0.25, 0.35,0.45,0.55)
+
+for (i in MEDissThres) {
+  merge=mergeCloseModules(normalized_counts,MEs=MEs,dynamicColors, cutHeight = i, verbose = 3) #merge function
+  mergedColors = merge$colors; #merged module colors
+  mergedMEs = merge$newMEs; #merged eigengenes
+  j = gsub("\\.", "", as.character(i))
+  pdf(paste0("wgcna_adolescent/ME_correlations_",j,".pdf"))
+  par(cex = 1.0)
+  plotEigengeneNetworks(mergedMEs, paste0("Eigengene dendrogram and heatmap at cutheight ",i), marDendro = c(0,4,2,0),marHeatmap = c(3,4,2,2),
+  plotDendrograms = TRUE, xLabelsAngle = 90)
+  dev.off()
+}
+
+# Cut height of 0.25 has 17 modules, 0.35 has 13 modules, 0.45 has 11 modules, 0.55 has 8 modules
+# Using a cut height of 0.25 because it has a good number of modules (17)
+
+```
+
+# Save merged network at cutheight 0.25
+```{r}
+merge=mergeCloseModules(normalized_counts,MEs=MEs,dynamicColors, cutHeight = 0.25, verbose = 3) #merge function
+mergedColors = merge$colors; #merged module colors
+mergedMEs = merge$newMEs; #merged eigengenes
+
+# Rename to moduleColors
+moduleColors = mergedColors
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50));
+moduleLabels = match(moduleColors, colorOrder)-1;
+MEs = mergedMEs; #17 modules + grey module
+
+# Save module colors and labels for use in subsequent parts
+save(MEs, moduleLabels, moduleColors, geneTree, TOM,file = "wgcna_adolescent/WGCNA_mergednatwork_025_modulecolorslabels.RData")
+
+# Save module eigengene scores
+MEs_traits<-MEs%>%
+  rownames_to_column(.,var = "SID")%>%
+  left_join(coldata %>% rownames_to_column(.,var = "SID"), by = "SID")
+  
+# Save MEs_traits as a csv file (includes ID, ME scores, and covariates and variables from coldata), used to look at correlations between ME scores and covariates
+write.csv(MEs_traits, file="wgcna_adolescent/ModuleEigengenes_025_scores.csv")
+
+```
+
+# Correlate MEs with continuous variables
+```{r}
+load("wgcna_adolescent/WGCNA_mergednatwork_025_modulecolorslabels.RData")
+normalized_counts <- read.csv("wgcna_adolescent/normalized_counts.csv", row.names=1)
+
+# Define numbers of genes and samples
+nGenes = ncol(normalized_counts);
+nSamples = nrow(normalized_counts);
+# Recalculate MEs with color labels
+MEs0 = moduleEigengenes(normalized_counts, moduleColors)$eigengenes %>% select(-MEgrey)
+MEs = orderMEs(MEs0)
+
+# Create subsetted dataset with continuous variables of interest
+datTraits_numeric<-coldata%>%
+  dplyr::select(lgaadxp, aaddxp, pregnancy_drinking_perc, moage_t0, mograde, cigpday, potxp, gar2, age2009clinic,
+                RINe, Neutrophils, T.cells.CD4.memory.resting, NK.cells.activated, T.cells.CD8, B.cells.naive,
+                Monocytes, T.cells.CD4.naive, Macrophages.M2)%>%
+  mutate_all(as.numeric)
+
+# Compute correlations between ME values and continuous variables    
+moduleTraitCor = cor(MEs, datTraits_numeric, use = "p");
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples);
+
+# Configure plotting parameters for correlation heatmap (only display R values for significant correlations)
+#sizeGrWindow(9,7)
+# Will display correlations and their p-values
+textMatrix2 <-ifelse(moduleTraitPvalue<0.05,paste(signif(moduleTraitCor,2)), NA)
+dim(textMatrix2) = dim(moduleTraitCor)
+ySymbols<-str_remove(names(MEs),"ME")
+
+# Display heatmap of ME correlations with continuous demographic variables
+par(mar = c(8, 8, 1, 1));
+print(labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = names(datTraits_numeric),
+               yLabels = names(MEs),
+               ySymbols = str_remove(names(MEs),"ME"),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix2,
+               setStdMargins = FALSE,
+               cex.text = 0.8,
+               zlim = c(-1,1)))
+
+# Save heatmap as pdf
+pdf("wgcna_adolescent/ME_conttraits_025.pdf", width=9, height=10)
+par(mar = c(8, 8, 1, 1));
+labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = names(datTraits_numeric),
+               yLabels = names(MEs),
+               ySymbols = str_remove(names(MEs),"ME"),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix2,
+               setStdMargins = FALSE,
+               cex.text = 0.8,
+               zlim = c(-1,1))
+dev.off()
+
+# Observations: A lot of the modules are correlated with RINe and the 8 cell types, darkturquoise module correlated with gestational age.
+
+```
+
+# ME mean differences by categorical variables
+```{r}
+# Compute t.tests for difference in mean ME values across categorical variables
+eigen_cat_ttest<-MEs%>%
+  rownames_to_column(.,var = "SID")%>%
+  left_join(coldata %>% rownames_to_column(.,var = "SID"), by = "SID")%>%
+  dplyr::select(SID, heavyExpYN, sexr3, starts_with("ME",ignore.case=FALSE))%>%
+  mutate(sexr3=factor(sexr3),
+         heavyExpYN=factor(heavyExpYN))%>%
+  pivot_longer(!c(SID,starts_with("ME",ignore.case=FALSE)),names_to="Demo",values_to="Demo_value")%>%
+  pivot_longer(!c(SID,Demo,Demo_value),names_to="ME",values_to="ME_value")%>%
+  mutate(group=paste(Demo,ME,sep="_"))%>%
+  nest(data = -group) %>% 
+  mutate(
+    test = map(data, ~ t.test(ME_value ~ Demo_value, data = .x)),
+    tidied = map(test, tidy)
+  ) %>% 
+  unnest(tidied)
+
+sig.MEs<-eigen_cat_ttest%>%
+  filter(p.value<0.05)%>%
+  mutate(ME=str_remove(group, ".*_"))%>%
+  pull(ME)
+
+# MElightcyan: sexr3
+
+# Display boxplots of MEs differentially coexpressed across categorical variables
+MEs_cat_boxplot<-MEs%>%
+  rownames_to_column(.,var = "SID")%>%
+  left_join(coldata %>% rownames_to_column(.,var = "SID"), by = "SID")%>%
+  dplyr::select(SID, heavyExpYN, sexr3, starts_with("ME",ignore.case=FALSE))%>%
+  mutate(sexr3=factor(sexr3),
+         heavyExpYN=factor(heavyExpYN))%>%
+  pivot_longer(!c(SID,starts_with("ME")),names_to="Demo",values_to="Demo_value")%>%
+  pivot_longer(!c(SID,Demo,Demo_value),names_to="ME",values_to="ME_value")%>%
+  mutate(group=paste(Demo,ME,sep="_"))%>%
+  filter(ME%in%sig.MEs)%>%
+  mutate(ME=str_remove(ME,"ME"))%>%
+  ggplot(.,aes(x=Demo_value, y=ME_value))+
+  geom_boxplot(aes(fill=Demo_value)) +
+  #geom_text(aes(label = ifelse(significant, "*", "")))+
+  # scale_y_log10()+
+  theme_bw()+
+  theme(axis.title=element_blank(),
+        axis.text.y=element_text(size=14),
+        axis.text.x=element_text(size=14,angle=25,vjust=0.5),
+        legend.position = 'none',
+        strip.background = element_blank(),
+        strip.text = element_text(size = 12))+
+  facet_grid(ME~Demo,space="free",scales='free')
+
+MEs_cat_boxplot
+
+# Save boxplot as pdf
+pdf("wgcna_adolescent/ME_cattraits_025.pdf")
+MEs_cat_boxplot
+dev.off()
+
+# Observations: Only one module (MElightcyan) has statistically significant difference in mean ME values between sexr3, none for heavyExpYN.
+
+```
+
+# Add hgnc symbol and chromosome name to res and find statistically significant genes
+```{r}
+# Differential gene expression analysis continued
+
+# Overall
+res <- results(dds, contrast=c("heavyExpYN","0","1"), tidy=TRUE)
+# res_merged will include hgnc symbols and chromosome numbers
+res_merged <- res
+# Rename ensembl_gene_id column in order to merge
+colnames(res_merged)[colnames(res_merged) == "row"] <- "ensembl_gene_id"
+# Added hgnc symbol and chromosome name to res_merged
+res_merged <- merge(res_merged, gene_symbol_mapping, by = "ensembl_gene_id", all.x = TRUE)
+res_merged <- res_merged[order(res_merged$padj),]
+res_merged
+
+# Female
+res_female <- results(dds_female, contrast=c("heavyExpYN","0","1"), tidy=TRUE)
+res_merged_female <- res_female
+colnames(res_merged_female)[colnames(res_merged_female) == "row"] <- "ensembl_gene_id"
+res_merged_female <- merge(res_merged_female, gene_symbol_mapping, by = "ensembl_gene_id", all.x = TRUE)
+res_merged_female <- res_merged_female[order(res_merged_female$padj),]
+res_merged_female
+
+# Male
+res_male <- results(dds_male, contrast=c("heavyExpYN","0","1"), tidy=TRUE)
+res_merged_male <- res_male
+colnames(res_merged_male)[colnames(res_merged_male) == "row"] <- "ensembl_gene_id"
+res_merged_male <- merge(res_merged_male, gene_symbol_mapping, by = "ensembl_gene_id", all.x = TRUE)
+res_merged_male <- res_merged_male[order(res_merged_male$padj),]
+res_merged_male
+
+```
+
+# Create dataset mapping genes to modules (and add hgnc symbols)
+```{r}
+modNames = substring(names(MEs), 3)
+
+geneModuleMembership = as.data.frame(cor(normalized_counts, MEs, use = "p"));
+MMPvalue = as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples));
+
+names(geneModuleMembership) = paste("MM", modNames, sep="");
+names(MMPvalue) = paste("p.MM", modNames, sep="");
+
+# Add gene annotations
+annot = res_merged;
+annot<-annot%>%
+  distinct(ensembl_gene_id,.keep_all=TRUE)%>%
+  dplyr::select(ensembl_gene_id,hgnc_symbol,chromosome_name)
+
+geneModuleMembership<-geneModuleMembership%>%
+  rownames_to_column(var="ensembl_gene_id")%>%
+  left_join(annot%>%dplyr::select(ensembl_gene_id, hgnc_symbol,chromosome_name), by = "ensembl_gene_id")%>%
+  mutate(modColor=moduleColors)%>%
+  relocate(c(hgnc_symbol,chromosome_name,modColor), .after = ensembl_gene_id)
+
+write.csv(geneModuleMembership,file="wgcna_adolescent/WGCNA_gene_MM_025.csv")
+
+length(unique(moduleColors)) # 17 modules + unmapped module
+# 4 additional columns include ensemble_gene_id, hgnc_symbol, chromosome_name, and modColor (which module the gene is from)
+length((colnames(geneModuleMembership)))
+
+# geneModuleMembership or WGCNA_modules is the dataset with all the genes/hgnc symbols, the modules they belong to, and ME scores across all the modules
+
+```
+
+# Assign biological processes to modules based on gene ontology enrichment
+```{r}
+WGCNA_modules<-read.csv("wgcna_adolescent/WGCNA_gene_MM_025.csv",row.names=1)
+
+listEnrichrSites()
+setEnrichrSite("Enrichr") # Human genes
+websiteLive <- TRUE
+dbs <- listEnrichrDbs()
+
+gene_list<-list()
+for (i in unique(WGCNA_modules$modColor)) {
+  gene_list[[i]]<-WGCNA_modules$hgnc_symbol[WGCNA_modules$modColor==i]
+}
+
+KEGG_enrich <- lapply(gene_list, function(x) 
+                 enrichr(x, databases = "KEGG_2021_Human")[[1]])
+names(KEGG_enrich) <- paste0(names(KEGG_enrich), '_KEGG')
+list2env(KEGG_enrich, .GlobalEnv)
+
+GOmf_enrich <- lapply(gene_list, function(x) 
+                 enrichr(x, databases = "GO_Molecular_Function_2021")[[1]])
+names(GOmf_enrich) <- paste0(names(GOmf_enrich), '_GOmf')
+list2env(GOmf_enrich, .GlobalEnv)
+
+GOcc_enrich <- lapply(gene_list, function(x) 
+                 enrichr(x, databases = "GO_Cellular_Component_2021")[[1]])
+names(GOcc_enrich) <- paste0(names(GOcc_enrich), '_GOcc')
+list2env(GOcc_enrich, .GlobalEnv)
+
+# This one is usually used
+GObp_enrich <- lapply(gene_list, function(x) 
+                 enrichr(x, databases = "GO_Biological_Process_2021")[[1]])
+names(GObp_enrich) <- paste0(names(GObp_enrich), '_GObp')
+list2env(GObp_enrich, .GlobalEnv)
+
+# Save the gene ontology's
+saveRDS(KEGG_enrich,"wgcna_adolescent/GO/WGCNA_enrich_KEGG_025.RDS")
+saveRDS(GOmf_enrich,"wgcna_adolescent/GO/WGCNA_enrich_GOmf_025.RDS")
+saveRDS(GOcc_enrich,"wgcna_adolescent/GO/WGCNA_enrich_GOcc_025.RDS")
+saveRDS(GObp_enrich,"wgcna_adolescent/GO/WGCNA_enrich_GObp_025.RDS")
+
+# Generate barplot of module GO assignments 
+WGCNA_modules%>%
+  group_by(modColor)%>%
+  tally()%>%
+  arrange(desc(n))
+
+# Gene functions based on GObp_enrich
+val<-c("organelle organization",
+       "platelet degranulation",
+       "tRNA aminoacylation for protein translation",
+       NA,
+       "receptor-mediated endocytosis",
+       "neutrophil mediated immunity",
+       "mRNA processing",
+       "defense response to virus",
+       "B cell receptor signaling pathway",
+       "adenylate cyclase-modulating G protein-coupled receptor signaling pathway",
+       "neutrophil activation involved in immune response",
+       "IRE1-mediated unfolded protein response",
+       "RNA splicing, via transesterification reactions with bulged adenosine as nucleophile",
+       "SRP-dependent cotranslational protein targeting to membrane",
+       "regulation of immune response",
+       "regulation of store-operated calcium entry",
+       "protein K11-linked ubiquitination",
+       "mitotic spindle organization")
+# These are the most significant processes for each module (based on p-value)
+color_list <- unique(moduleColors)
+
+module_GO_barplot<-WGCNA_modules %>% 
+  mutate(modColor=factor(modColor,levels=c(color_list)))%>%
+  group_by(modColor) %>%  
+  tally() %>% 
+  mutate(modColor = reorder(modColor, n)) %>%
+  ggplot(., aes(x = modColor, y = n)) +  
+  geom_bar(stat = "identity",fill=c(color_list)) +  
+  labs(x='Module',y='Gene Count')+ 
+  geom_text(aes(label = val),size=3,hjust=-0.2)+ 
+  scale_y_continuous(limits=c(0,8000))+  
+  theme(plot.title = element_text(size = 16,face='bold'))+
+  theme_bw()+
+  theme(axis.text = element_text(size = 12))+  
+  theme(axis.title.x = element_text(size = 14,face="bold"),
+        axis.title.y=element_blank())+  
+  coord_flip()
+
+module_GO_barplot
+
+# Save GO barplot as pdf
+pdf("wgcna_adolescent/GO/WGCNA_modules_GOpathways.pdf", width = 8, height = 6)
+module_GO_barplot
+dev.off()
+
+# Barplot shows the most common biological processes associated with the genes from each of the modules
+# Observations: darkgreen and darkorange modules had the most genes, these modules are associated with organelle organization and neutrophil activation involved in immune response
+
+```
+
+# Identify hub genes for each module (top 15 most interconnected genes)
+```{r hubs}
+mergedColors=moduleColors
+kIn<-intramodularConnectivity(adjacency, mergedColors, scaleByMax = FALSE)
+
+# merged_color_matrix is the table with each gene and the associated module it's in
+merged_color_matrix<-as.matrix(mergedColors)
+rownames(merged_color_matrix)<-colnames(normalized_counts)
+Results_KIn<-merge(kIn, merged_color_matrix,by="row.names")
+
+Results_KIn<-Results_KIn%>%
+  dplyr::rename(ensembl_gene_id=Row.names,module=V1)%>%
+  mutate(ensembl_gene_id=str_remove(ensembl_gene_id,"\\..*"))%>%
+  left_join(annot)%>%
+  arrange(module,-kWithin)
+
+# hubs_KIN has the top 15 hub genes for each module along with it's hgnc symbol and chromosome number
+hubs_kIN<-Results_KIn%>%
+  group_by(module)%>%
+ slice_max(kWithin,n=15)
+
+hubs_kIN
+
+saveRDS(hubs_kIN,"wgcna_adolescent/hubs_kIN_025.RDS")
+
+# hubs_kIN includes the top 15 most interconnected genes in each of the 17 modules + grey module in the wgcna network
+
+```
+
+# Overlap of modules and DEGs (differentially expressed genes)
+```{r}
+WGCNA_modules<-geneModuleMembership
+
+# Overall
+DEG<- res_merged
+# module_DEG includes the genes that have statistically significant adjusted p-values and their associated module
+module_DEG<-DEG%>%
+  filter(padj<0.05)%>%
+  left_join(WGCNA_modules%>%dplyr::select(ensembl_gene_id,hgnc_symbol,chromosome_name,modColor))%>%
+  arrange(modColor)
+module_DEG
+# Observation: There are no differentially expressed genes for heavyExpYN
+
+# Female
+DEG_female<- res_merged_female
+module_DEG_female<-DEG_female%>%
+  filter(padj<0.05)%>%
+  left_join(WGCNA_modules%>%dplyr::select(ensembl_gene_id,hgnc_symbol,chromosome_name,modColor))%>%
+  arrange(modColor)
+module_DEG_female
+# Observation: There are no differentially expressed genes for heavyExpYN
+
+# Male
+DEG_male<- res_merged_male
+module_DEG_male<-DEG_male%>%
+  filter(padj<0.05)%>%
+  left_join(WGCNA_modules%>%dplyr::select(ensembl_gene_id,hgnc_symbol,chromosome_name,modColor))%>%
+  arrange(modColor)
+module_DEG_male
+# Observation: There are no differentially expressed genes for heavyExpYN
+
+```
+
+# Create function that runs linear regression models testing associations between MEs and specified predictor associated with alcohol use (runs crude model, model adjusting for some covariates, and model adjusting for some covariates and cell types)
+```{r}
+all <- read.csv("wgcna_adolescent/ModuleEigengenes_025_scores.csv") |>
+  select(-MEgrey)
+male <- all |> filter(sexr3 == 1)
+female <- all |> filter(sexr3 == 2)
+
+layout <- c(area(t = 0, l = 0, b = 30, r = 7),
+            area(t = 2.5, l = 8, b = 30, r =11 ),
+            area(t = 0, l = 12, b = 30, r = 15),
+            area(t = 2.5, l = 16, b = 30, r = 19),
+            area(t = 0, l = 20, b = 30, r = 23),
+            area(t = 2.5, l = 24, b = 30, r = 27)
+            )
+
+glmplot_function <- function(data, predictor) {
+  
+  # Run linear regressions
+  
+  MEs_long<-data%>%
+  dplyr::select(SID, starts_with("ME",ignore.case=FALSE), moage_t0, mograde, age2009clinic, RINe,
+                Neutrophils, T.cells.CD4.memory.resting, NK.cells.activated, T.cells.CD8, B.cells.naive,
+                Monocytes, T.cells.CD4.naive, Macrophages.M2, predictor)%>%
+  pivot_longer(starts_with("ME",ignore.case=FALSE),names_to="Module",values_to="Score")
+  
+  # Detect if the predictor is binary
+  binary <- is.factor(MEs_long[[predictor]]) && length(levels(MEs_long[[predictor]])) == 2
+  # If else statement for formulas and filter terms
+  if (binary) {
+    formula_crude <- as.formula(paste("Score ~ factor(", predictor, ")"))
+    formula_covs <- as.formula(paste("Score ~ factor(", predictor, ") + moage_t0 + mograde +
+                                     age2009clinic + RINe"))
+    formula_covscells <- as.formula(paste("Score ~ factor(", predictor, ") + moage_t0 + mograde + 
+    age2009clinic + RINe + Neutrophils + T.cells.CD4.memory.resting + NK.cells.activated + 
+    T.cells.CD8 + B.cells.naive + Monocytes + T.cells.CD4.naive + Macrophages.M2"))
+    filter_predictor <- paste("factor(", predictor, ")1")
+  } else {
+    formula_crude <- as.formula(paste("Score ~ ", predictor))
+    formula_covs <- as.formula(paste("Score ~ ", predictor, " + moage_t0 + mograde + 
+                                     age2009clinic + RINe"))
+    formula_covscells <- as.formula(paste("Score ~ ", predictor, " + moage_t0 + mograde + 
+    age2009clinic + RINe + Neutrophils + T.cells.CD4.memory.resting + NK.cells.activated + 
+    T.cells.CD8 + B.cells.naive + Monocytes + T.cells.CD4.naive + Macrophages.M2"))
+    filter_predictor <- predictor
+    }
+  
+  glm_crude<-MEs_long%>%
+    nest(data=-c(Module))%>%
+    mutate(
+      test=map(data, ~lm(formula_crude, data=.x)),
+      tidied=map(test, tidy, conf.int=TRUE)
+      ) %>%
+    unnest(tidied)%>%
+    mutate(model="glm_crude")
+  
+  glm_crude_predictor<-glm_crude%>%
+    filter(term==filter_predictor)%>%
+    dplyr::select(Module, estimate, std.error, statistic, p.value, conf.low, conf.high, model)
+  
+  glm_covs<-MEs_long%>%
+    nest(data=-c(Module))%>%
+    mutate(
+      test=map(data, ~lm(formula_covs, data=.x)),
+      tidied=map(test, tidy, conf.int=TRUE)
+      ) %>%
+    unnest(tidied)%>%
+    mutate(model="glm_covs")
+  
+  glm_covs_predictor<-glm_covs%>%
+    filter(term==filter_predictor)%>%
+    dplyr::select(Module, estimate, std.error, statistic, p.value, conf.low, conf.high, model)
+  
+  glm_covscells<-MEs_long%>%
+    nest(data=-c(Module))%>%
+    mutate(
+      test=map(data, ~lm(formula_covscells, data=.x)),
+      tidied=map(test,tidy,conf.int=TRUE)
+      ) %>%
+    unnest(tidied)%>%
+    mutate(model="glm_covscells")
+  
+  glm_covscells_predictor<-glm_covscells%>%
+    filter(term==filter_predictor)%>%
+    dplyr::select(Module, estimate, std.error, statistic, p.value, conf.low, conf.high, model)
+  
+  glms<-bind_rows(glm_crude, glm_covs, glm_covscells)%>%
+    dplyr::select(Module, term, estimate, std.error, statistic, p.value, conf.low, conf.high, model)
+  glms
+  
+  glms_predictor<-bind_rows(glm_crude_predictor, glm_covs_predictor, glm_covscells_predictor)
+  glms_predictor
+  
+  # Save linear regression results for the three models
+  data_name <- deparse(substitute(data))
+  write.csv(glms, file=paste0("wgcna_adolescent/GLM/", data_name, "/", predictor, "_fullresults.csv"))
+  write.csv(glms_predictor, file=paste0("wgcna_adolescent/GLM/", data_name, "/", predictor, "_results.csv"))
+  
+  
+  # Create plots
+  
+  crude<-glm_crude_predictor%>%
+    mutate(Module=str_remove(Module,"ME"))%>%
+    mutate(across(c(estimate, conf.low, conf.high),~ formatC(round(.x,2),2,format="f")),
+           estimate_lab = paste0(estimate, " (", conf.low, ", ", conf.high, ")")) %>%
+    mutate(p.value=ifelse(p.value<0.05,"<0.05",as.character(sprintf("%.2f", round(p.value, 2)))))%>%
+    bind_rows(data.frame(Module = "Module", 
+                         estimate_lab = paste0("Crude ",intToUtf8(0x03B2)," (95% CI)"), 
+                         conf.low = "",conf.high = "",p.value = "p-value"))
+  crude<-crude%>%
+    mutate(Module=fct_rev(fct_relevel(Module, "Module")))
+  
+  covs<-glm_covs_predictor%>%
+    mutate(Module=str_remove(Module,"ME"))%>%
+    mutate(across(c(estimate, conf.low, conf.high),~ formatC(round(.x,2),2,format="f")),
+           estimate_lab = paste0(estimate, " (", conf.low, ", ", conf.high, ")")) %>%
+    mutate(p.value=ifelse(p.value<0.05,"<0.05",as.character(sprintf("%.2f", round(p.value, 2)))))%>%
+    bind_rows(data.frame(Module = "Module", 
+                         estimate_lab = paste0("Covs ",intToUtf8(0x03B2)," (95% CI)"), 
+                         conf.low = "",conf.high = "",p.value = "p-value"))
+  covs<-covs%>%
+    mutate(Module=fct_rev(fct_relevel(Module, "Module")))
+  
+  covscells<-glm_covscells_predictor%>%
+    mutate(Module=str_remove(Module,"ME"))%>%
+    mutate(across(c(estimate, conf.low, conf.high),~ formatC(round(.x,2),2,format="f")),
+           estimate_lab = paste0(estimate, " (", conf.low, ", ", conf.high, ")")) %>%
+    mutate(p.value=ifelse(p.value<0.05,"<0.05",as.character(sprintf("%.2f", round(p.value, 2)))))%>%
+    bind_rows(data.frame(Module = "Module", 
+                         estimate_lab = paste0("Covs+Cells ",intToUtf8(0x03B2)," (95% CI)"),
+                         conf.low = "",conf.high = "",p.value = "p-value"))
+  covscells<-covscells%>%
+    mutate(Module=fct_rev(fct_relevel(Module, "Module")))
+  
+  p_1<-crude%>%
+    ggplot(aes(y = Module))+
+    geom_text(aes(x = 0, label = Module), hjust = 0, fontface = "bold")+
+    geom_text(aes(x = 2, label = estimate_lab), hjust = 0,
+              fontface = ifelse(crude$estimate_lab == paste0("Crude ",intToUtf8(0x03B2)," (95% CI)"),
+                                "bold", "plain"))+
+    theme_void() +
+    coord_cartesian(xlim = c(0, 4))
+  
+  p_2<-glm_crude_predictor%>%
+    filter(!Module=="Module")%>%
+    ggplot(aes(y=fct_rev(Module))) + 
+    geom_point(aes(x=estimate), shape=15, size=3) +
+    geom_linerange(aes(xmin=conf.low, xmax=conf.high)) +
+    theme_classic() + 
+    geom_vline(xintercept = 0, linetype="dashed") +
+    labs(x=expression(paste(beta, " estimate")), y="")+
+    theme(axis.line.y = element_blank(),
+          axis.ticks.y= element_blank(),
+          axis.text.y= element_blank(),
+          axis.title.y= element_blank())
+  
+  p_3<-covs%>%
+    ggplot(aes(y = Module))+
+    geom_text(aes(x = 1, label = estimate_lab), hjust = 0,
+              fontface = ifelse(covs$estimate_lab == paste0("Covs ",intToUtf8(0x03B2)," (95% CI)"),
+                                "bold", "plain"))+theme_void() +
+    coord_cartesian(xlim = c(0, 4))
+  
+  p_4<-glm_covs_predictor%>%
+    filter(!Module=="Module")%>%
+    ggplot(aes(y=fct_rev(Module))) + 
+    geom_point(aes(x=estimate), shape=15, size=3) +
+    geom_linerange(aes(xmin=conf.low, xmax=conf.high)) +
+    theme_classic() + 
+    geom_vline(xintercept = 0, linetype="dashed") +
+    labs(x=expression(paste(beta, " estimate")), y="")+
+    theme(axis.line.y = element_blank(),
+          axis.ticks.y= element_blank(),
+          axis.text.y= element_blank(),
+          axis.title.y= element_blank())
+  
+  p_5<-covscells%>%
+    ggplot(aes(y = Module))+
+    geom_text(aes(x = 1, label = estimate_lab), hjust = 0,
+              fontface = ifelse(covs$estimate_lab == paste0("Covs+Cells ",intToUtf8(0x03B2)," (95% CI)"),
+                                "bold", "plain"))+
+    theme_void() +
+    coord_cartesian(xlim = c(0, 4))
+  
+  p_6<-glm_covscells_predictor%>%
+    filter(!Module=="Module")%>%
+    ggplot(aes(y=fct_rev(Module))) + 
+    geom_point(aes(x=estimate), shape=15, size=3) +
+    geom_linerange(aes(xmin=conf.low, xmax=conf.high)) +
+    theme_classic() + 
+    geom_vline(xintercept = 0, linetype="dashed") +
+    labs(x=expression(paste(beta, " estimate")), y="")+
+    theme(axis.line.y = element_blank(),
+          axis.ticks.y= element_blank(),
+          axis.text.y= element_blank(),
+          axis.title.y= element_blank())
+  
+  glm_plot<-p_1 + p_2 + p_3 + p_4 + p_5 + p_6 + plot_layout(design = layout)
+  
+  # Save linear regression plot
+  pdf(paste0("wgcna_adolescent/GLM/", data_name, "/", predictor, "_plot.pdf"), width = 18, height = 4)  
+  print(glm_plot)
+  dev.off()
+  
+  return(glm_plot)
+  
+}
+```
+
+# LR: All participants
+```{r}
+detach("package:dplyr", unload = TRUE)
+library(dplyr)
+# Plot for heavyExpYN (heavy exposure binary variable) as the predictor for ME score
+glmplot_function(data=all, predictor="heavyExpYN")
+# Observations: On average, the ME scores across all modules is the same in both those who weren't exposed to heavy alcohol and those who were according to the models (all estimates include 0). There is no statistically significant evidence of a difference in ME scores between these two groups (most p-values>0.05) according to the models.
+
+# Plot for lgaadxp (average daily ounces prenatal absolute alcohol +1) as the predictor for ME score
+glmplot_function(data=all, predictor="lgaadxp")
+
+# Plot for aaddxp (average ounces prenatal absolute alcohol per drinking occasion) as the predictor for ME score
+glmplot_function(data=all, predictor="aaddxp")
+
+# Plot for pregnancy_drinking_perc (percent of days on which mother drank alcohol prenatally) as the predictor for ME score
+glmplot_function(data=all, predictor="pregnancy_drinking_perc")
+```
+
+# Tables for the statistically significant modules functions
+```{r}
+# Read in gene enrichment results
+GObp_enrich <- readRDS("wgcna_adolescent/GO/WGCNA_enrich_GObp_025.RDS")
+
+# Create function
+module_func <- function(color) {
+  GObp_enrich[[paste0(color, "_GObp")]] |>
+  dplyr::select(Term, Adjusted.P.value) |>
+  dplyr::filter(Adjusted.P.value < 0.05) |>
+  dplyr::mutate(Term = trimws(sub("\\(.*", "", Term))) |>
+  dplyr::rename(Function = Term) |>
+  head(10) |>
+  knitr::kable(caption = paste(color, "Module Functions (Adolescent Cohort)"),
+               digits = 10)
+}
+
+module_func("darkgrey") # darkgrey module
+module_func("steelblue") # steelblue module
+module_func("saddlebrown") # saddlebrown module
+
+```
+
+# Top 10 expressed genes
+```{r}
+# Read in normalized_counts 
+normalized_counts <- read.csv("wgcna_adolescent/normalized_counts.csv")
+
+# Read in dataset with all the genes/hgnc symbols and their modules and scores
+WGCNA_modules <- read.csv("wgcna_adolescent/WGCNA_gene_MM_025.csv",row.names=1) |>
+  select(ensembl_gene_id, hgnc_symbol) |>
+  rename(Gene = ensembl_gene_id)
+
+# Average genes across participants and make a table of the top 10 expressed genes
+top10 <- normalized_counts |>
+  rename(ID = X) |>
+  pivot_longer(
+    c(starts_with("ENS")),
+    names_to = "Gene",
+    values_to = "Count"
+    ) |>
+  group_by(Gene) |>
+  summarize(
+    Total = mean(Count)
+  ) |>
+  arrange(desc(Total)) |>
+  head(10) |>
+  merge(WGCNA_modules, by = "Gene", all.x = TRUE) |>
+  select(hgnc_symbol, Total) |>
+  rename(
+    Gene = hgnc_symbol,
+    Count = Total
+  ) 
+top10 |>
+  kable(caption = "Top 10 Expressed Genes")
+
+```
+
+# LR: Males
+```{r}
+# Plot for heavyExpYN as the predictor for ME score
+glmplot_function(data=male, predictor="heavyExpYN")
+# Plot for lgaadxp as the predictor for ME score
+glmplot_function(data=male, predictor="lgaadxp")
+# Plot for aaddxp as the predictor for ME score
+glmplot_function(data=male, predictor="aaddxp")
+# Plot for pregnancy_drinking_perc as the predictor for ME score
+glmplot_function(data=male, predictor="pregnancy_drinking_perc")
+```
+
+# LR: Females
+```{r}
+# Plot for heavyExpYN as the predictor for ME score
+glmplot_function(data=female, predictor="heavyExpYN")
+# Plot for lgaadxp as the predictor for ME score
+glmplot_function(data=female, predictor="lgaadxp")
+# Plot for aaddxp as the predictor for ME score
+glmplot_function(data=female, predictor="aaddxp")
+# Plot for pregnancy_drinking_perc as the predictor for ME score
+glmplot_function(data=female, predictor="pregnancy_drinking_perc")
+```
+
+# FDR correction (models adjusting for covs)
+```{r}
+# Load in LR results
+overall_heavyExpYN <- read.csv("wgcna_adolescent/GLM/all/heavyExpYN_results.csv") |>
+  filter(model == "glm_covs")
+male_heavyExpYN <- read.csv("wgcna_adolescent/GLM/male/heavyExpYN_results.csv") |>
+  filter(model == "glm_covs")
+female_heavyExpYN <- read.csv("wgcna_adolescent/GLM/female/heavyExpYN_results.csv")|>
+  filter(model == "glm_covs")
+overall_aaddxp <- read.csv("wgcna_adolescent/GLM/all/aaddxp_results.csv") |>
+  filter(model == "glm_covs")
+male_aaddxp <- read.csv("wgcna_adolescent/GLM/male/aaddxp_results.csv") |>
+  filter(model == "glm_covs")
+female_aaddxp <- read.csv("wgcna_adolescent/GLM/female/aaddxp_results.csv") |>
+  filter(model == "glm_covs")
+overall_pregnancy <- read.csv("wgcna_adolescent/GLM/all/pregnancy_drinking_perc_results.csv") |>
+  filter(model == "glm_covs")
+male_pregnancy <- read.csv("wgcna_adolescent/GLM/male/pregnancy_drinking_perc_results.csv") |>
+  filter(model == "glm_covs")
+female_pregnancy <- read.csv("wgcna_adolescent/GLM/female/pregnancy_drinking_perc_results.csv") |>
+  filter(model == "glm_covs")
+
+# Pull numeric vectors of the p-values
+overall_heavyExpYN.p <- overall_heavyExpYN |> pull(p.value) |> as.numeric()
+male_heavyExpYN.p <- male_heavyExpYN |> pull(p.value) |> as.numeric()
+female_heavyExpYN.p <- female_heavyExpYN |> pull(p.value) |> as.numeric()
+overall_aaddxp.p <- overall_aaddxp |> pull(p.value) |> as.numeric()
+male_aaddxp.p <- male_aaddxp |> pull(p.value) |> as.numeric()
+female_aaddxp.p <- female_aaddxp |> pull(p.value) |> as.numeric()
+overall_pregnancy.p <- overall_pregnancy |> pull(p.value) |> as.numeric()
+male_pregnancy.p <- male_pregnancy |> pull(p.value) |> as.numeric()
+female_pregnancy.p <- female_pregnancy |> pull(p.value) |> as.numeric()
+
+# Add FDR correction column
+overall_heavyExpYN$p.adj <- p.adjust(overall_heavyExpYN.p, method = "fdr", n = length(overall_heavyExpYN.p))
+male_heavyExpYN$p.adj <- p.adjust(male_heavyExpYN.p, method = "fdr", n = length(male_heavyExpYN.p))
+female_heavyExpYN$p.adj <- p.adjust(female_heavyExpYN.p, method = "fdr", n = length(female_heavyExpYN.p))
+overall_aaddxp$p.adj <- p.adjust(overall_aaddxp.p, method = "fdr", n = length(overall_aaddxp.p))
+male_aaddxp$p.adj <- p.adjust(male_aaddxp.p, method = "fdr", n = length(male_aaddxp.p))
+female_aaddxp$p.adj <- p.adjust(female_aaddxp.p, method = "fdr", n = length(female_aaddxp.p))
+overall_pregnancy$p.adj <- p.adjust(overall_pregnancy.p, method = "fdr", n = length(overall_pregnancy.p))
+male_pregnancy$p.adj <- p.adjust(male_pregnancy.p, method = "fdr", n = length(male_pregnancy.p))
+female_pregnancy$p.adj <- p.adjust(female_pregnancy.p, method = "fdr", n = length(female_pregnancy.p))
+
+# Check if there are any significant p.adj values
+overall_heavyExpYN.sig <- overall_heavyExpYN |> filter(p.adj<0.05)
+overall_heavyExpYN.sig
+male_heavyExpYN.sig <- male_heavyExpYN |> filter(p.adj<0.05)
+male_heavyExpYN.sig
+female_heavyExpYN.sig <- female_heavyExpYN |> filter(p.adj<0.05)
+female_heavyExpYN.sig
+overall_aaddxp.sig <- overall_aaddxp |> filter(p.adj<0.05)
+overall_aaddxp.sig
+male_aaddxp.sig <- male_aaddxp |> filter(p.adj<0.05)
+male_aaddxp.sig
+female_aaddxp.sig <- female_aaddxp |> filter(p.adj<0.05)
+female_aaddxp.sig
+overall_pregnancy.sig <- overall_pregnancy |> filter(p.adj<0.05)
+overall_pregnancy.sig
+male_pregnancy.sig <- male_pregnancy |> filter(p.adj<0.05)
+male_pregnancy.sig
+female_pregnancy.sig <- female_pregnancy |> filter(p.adj<0.05)
+female_pregnancy.sig
+
+# Observation: None of the FDR adjusted p-values are statistically significant
+```
+
+# FDR correction (models adjusting for covs+cells)
+```{r}
+# Load in LR results
+overall_heavyExpYN <- read.csv("wgcna_adolescent/GLM/all/heavyExpYN_results.csv") |>
+  filter(model == "glm_covscells")
+male_heavyExpYN <- read.csv("wgcna_adolescent/GLM/male/heavyExpYN_results.csv") |>
+  filter(model == "glm_covscells")
+female_heavyExpYN <- read.csv("wgcna_adolescent/GLM/female/heavyExpYN_results.csv")|>
+  filter(model == "glm_covscells")
+overall_aaddxp <- read.csv("wgcna_adolescent/GLM/all/aaddxp_results.csv") |>
+  filter(model == "glm_covscells")
+male_aaddxp <- read.csv("wgcna_adolescent/GLM/male/aaddxp_results.csv") |>
+  filter(model == "glm_covscells")
+female_aaddxp <- read.csv("wgcna_adolescent/GLM/female/aaddxp_results.csv") |>
+  filter(model == "glm_covscells")
+overall_pregnancy <- read.csv("wgcna_adolescent/GLM/all/pregnancy_drinking_perc_results.csv") |>
+  filter(model == "glm_covscells")
+male_pregnancy <- read.csv("wgcna_adolescent/GLM/male/pregnancy_drinking_perc_results.csv") |>
+  filter(model == "glm_covscells")
+female_pregnancy <- read.csv("wgcna_adolescent/GLM/female/pregnancy_drinking_perc_results.csv") |>
+  filter(model == "glm_covscells")
+
+# Pull numeric vectors of the p-values
+overall_heavyExpYN.p <- overall_heavyExpYN |> pull(p.value) |> as.numeric()
+male_heavyExpYN.p <- male_heavyExpYN |> pull(p.value) |> as.numeric()
+female_heavyExpYN.p <- female_heavyExpYN |> pull(p.value) |> as.numeric()
+overall_aaddxp.p <- overall_aaddxp |> pull(p.value) |> as.numeric()
+male_aaddxp.p <- male_aaddxp |> pull(p.value) |> as.numeric()
+female_aaddxp.p <- female_aaddxp |> pull(p.value) |> as.numeric()
+overall_pregnancy.p <- overall_pregnancy |> pull(p.value) |> as.numeric()
+male_pregnancy.p <- male_pregnancy |> pull(p.value) |> as.numeric()
+female_pregnancy.p <- female_pregnancy |> pull(p.value) |> as.numeric()
+
+# Add FDR correction column
+overall_heavyExpYN$p.adj <- p.adjust(overall_heavyExpYN.p, method = "fdr", n = length(overall_heavyExpYN.p))
+male_heavyExpYN$p.adj <- p.adjust(male_heavyExpYN.p, method = "fdr", n = length(male_heavyExpYN.p))
+female_heavyExpYN$p.adj <- p.adjust(female_heavyExpYN.p, method = "fdr", n = length(female_heavyExpYN.p))
+overall_aaddxp$p.adj <- p.adjust(overall_aaddxp.p, method = "fdr", n = length(overall_aaddxp.p))
+male_aaddxp$p.adj <- p.adjust(male_aaddxp.p, method = "fdr", n = length(male_aaddxp.p))
+female_aaddxp$p.adj <- p.adjust(female_aaddxp.p, method = "fdr", n = length(female_aaddxp.p))
+overall_pregnancy$p.adj <- p.adjust(overall_pregnancy.p, method = "fdr", n = length(overall_pregnancy.p))
+male_pregnancy$p.adj <- p.adjust(male_pregnancy.p, method = "fdr", n = length(male_pregnancy.p))
+female_pregnancy$p.adj <- p.adjust(female_pregnancy.p, method = "fdr", n = length(female_pregnancy.p))
+
+# Check if there are any significant p.adj values
+overall_heavyExpYN.sig <- overall_heavyExpYN |> filter(p.adj<0.05)
+overall_heavyExpYN.sig
+male_heavyExpYN.sig <- male_heavyExpYN |> filter(p.adj<0.05)
+male_heavyExpYN.sig
+female_heavyExpYN.sig <- female_heavyExpYN |> filter(p.adj<0.05)
+female_heavyExpYN.sig
+overall_aaddxp.sig <- overall_aaddxp |> filter(p.adj<0.05)
+overall_aaddxp.sig
+male_aaddxp.sig <- male_aaddxp |> filter(p.adj<0.05)
+male_aaddxp.sig
+female_aaddxp.sig <- female_aaddxp |> filter(p.adj<0.05)
+female_aaddxp.sig
+overall_pregnancy.sig <- overall_pregnancy |> filter(p.adj<0.05)
+overall_pregnancy.sig
+male_pregnancy.sig <- male_pregnancy |> filter(p.adj<0.05)
+male_pregnancy.sig
+female_pregnancy.sig <- female_pregnancy |> filter(p.adj<0.05)
+female_pregnancy.sig
+
+# Observation: None of the FDR adjusted p-values are statistically significant
+```
+
+# Clean LR plots function
+```{r}
+all <- read.csv("wgcna_adolescent/ModuleEigengenes_025_scores.csv") |>
+  select(-MEgrey)
+male <- all |> filter(sexr3 == 1)
+female <- all |> filter(sexr3 == 2)
+
+layout <- c(area(t = 0, l = 0, b = 30, r = 2),
+            area(t = 0, l = 3, b = 30, r = 9),
+            area(t = 0, l = 10, b = 30, r = 14),
+            area(t = 0, l = 15, b = 30, r = 19)
+            )
+
+glmplot_function_clean <- function(data, predictor) {
+  
+  # Run linear regressions
+  
+  MEs_long<-data%>%
+  dplyr::select(SID, starts_with("ME",ignore.case=FALSE), moage_t0, mograde, age2009clinic, RINe,
+                Neutrophils, T.cells.CD4.memory.resting, NK.cells.activated, T.cells.CD8, B.cells.naive,
+                Monocytes, T.cells.CD4.naive, Macrophages.M2, predictor)%>%
+  pivot_longer(starts_with("ME",ignore.case=FALSE),names_to="Module",values_to="Score")
+  
+  # Detect if the predictor is binary
+  binary <- is.factor(MEs_long[[predictor]]) && length(levels(MEs_long[[predictor]])) == 2
+  # If else statement for formulas and filter terms
+  if (binary) {
+    formula_covs <- as.formula(paste("Score ~ factor(", predictor, ") + moage_t0 + mograde +
+                                     age2009clinic + RINe"))
+    formula_covscells <- as.formula(paste("Score ~ factor(", predictor, ") + moage_t0 + mograde + 
+    age2009clinic + RINe + Neutrophils + T.cells.CD4.memory.resting + NK.cells.activated + 
+    T.cells.CD8 + B.cells.naive + Monocytes + T.cells.CD4.naive + Macrophages.M2"))
+    filter_predictor <- paste("factor(", predictor, ")1")
+  } else {
+    formula_covs <- as.formula(paste("Score ~ ", predictor, " + moage_t0 + mograde + 
+                                     age2009clinic + RINe"))
+    formula_covscells <- as.formula(paste("Score ~ ", predictor, " + moage_t0 + mograde + 
+    age2009clinic + RINe + Neutrophils + T.cells.CD4.memory.resting + NK.cells.activated + 
+    T.cells.CD8 + B.cells.naive + Monocytes + T.cells.CD4.naive + Macrophages.M2"))
+    filter_predictor <- predictor
+    }
+  
+  glm_covs<-MEs_long%>%
+    nest(data=-c(Module))%>%
+    mutate(
+      test=map(data, ~lm(formula_covs, data=.x)),
+      tidied=map(test, tidy, conf.int=TRUE)
+      ) %>%
+    unnest(tidied)%>%
+    mutate(model="glm_covs")
+  
+  glm_covs_predictor<-glm_covs%>%
+    filter(term==filter_predictor)%>%
+    dplyr::select(Module, estimate, std.error, statistic, p.value, conf.low, conf.high, model)
+  
+  glm_covscells<-MEs_long%>%
+    nest(data=-c(Module))%>%
+    mutate(
+      test=map(data, ~lm(formula_covscells, data=.x)),
+      tidied=map(test,tidy,conf.int=TRUE)
+      ) %>%
+    unnest(tidied)%>%
+    mutate(model="glm_covscells")
+  
+  glm_covscells_predictor<-glm_covscells%>%
+    filter(term==filter_predictor)%>%
+    dplyr::select(Module, estimate, std.error, statistic, p.value, conf.low, conf.high, model)
+  
+  data_name <- deparse(substitute(data))
+  
+  # Create plots
+  
+  covs<-glm_covs_predictor%>%
+    mutate(Module=str_remove(Module,"ME"))%>%
+    mutate(across(c(estimate, conf.low, conf.high),~ formatC(round(.x,2),2,format="f")),
+           estimate_lab = paste0(estimate, " (", conf.low, ", ", conf.high, ")")) %>%
+    mutate(p.value=ifelse(p.value<0.05,"<0.05",as.character(sprintf("%.2f", round(p.value, 2)))))%>%
+    mutate(Function=c("platelet degranulation",
+                      "protein K11-linked ubiquitination",
+                      "neutrophil activation involved in immune response",
+                      "RNA splicing, via transesterification reactions with bulged adenosine as nucleophile",
+                      "receptor-mediated endocytosis",
+                      "defense response to virus",
+                      "regulation of store-operated calcium entry",
+                      "adenylate cyclase-modulating G protein-coupled receptor signaling pathway",
+                      "B cell receptor signaling pathway",
+                      "mRNA processing",
+                      "tRNA aminoacylation for protein translation",
+                      "mitotic spindle organization",
+                      "IRE1-mediated unfolded protein response",
+                      "regulation of immune response",
+                      "SRP-dependent cotranslational protein targeting to membrane",
+                      "neutrophil mediated immunity",
+                      "organelle organization"))
+  
+  covscells<-glm_covscells_predictor%>%
+    mutate(Module=str_remove(Module,"ME"))%>%
+    mutate(across(c(estimate, conf.low, conf.high),~ formatC(round(.x,2),2,format="f")),
+           estimate_lab = paste0(estimate, " (", conf.low, ", ", conf.high, ")")) %>%
+    mutate(p.value=ifelse(p.value<0.05,"<0.05",as.character(sprintf("%.2f", round(p.value, 2)))))
+  
+  p_1<-covs%>%
+    ggplot(aes(y = Module)) +
+    geom_text(aes(x = 0, label = Module), hjust = 0, fontface = "bold")+
+    labs(title = "Module") +
+    theme_void() +
+    coord_cartesian(xlim = c(0, 4))
+  
+  p_2<-covs%>%
+    ggplot(aes(y = Module))+
+    geom_text(aes(x = 0, label = Function), hjust = 0) +
+    labs(title = "Function") +
+    theme_void() +
+    coord_cartesian(xlim = c(0, 4))
+  
+  p_3<-glm_covs_predictor%>%
+    filter(!Module=="Module")%>%
+    ggplot(aes(y=Module)) +
+    geom_point(aes(x=estimate), shape=15, size=3) +
+    geom_linerange(aes(xmin=conf.low, xmax=conf.high)) +
+    theme_classic() + 
+    geom_vline(xintercept = 0, linetype="dashed") +
+    labs(title = paste0("Covariates ", intToUtf8(0x03B2), " (95% CI)"),
+         x=expression(paste(beta, " estimate")), 
+         y="") +
+    theme(axis.line.y = element_blank(),
+          axis.ticks.y= element_blank(),
+          axis.text.y= element_blank(),
+          axis.title.y= element_blank())
+  
+  p_4<-glm_covscells_predictor%>%
+    filter(!Module=="Module")%>%
+    ggplot(aes(y=Module)) + 
+    geom_point(aes(x=estimate), shape=15, size=3) +
+    geom_linerange(aes(xmin=conf.low, xmax=conf.high)) +
+    theme_classic() + 
+    geom_vline(xintercept = 0, linetype="dashed") +
+    labs(title = paste0("Covariates+Cells ",intToUtf8(0x03B2)," (95% CI)"),
+         x=expression(paste(beta, " estimate")), 
+         y="")+
+    theme(axis.line.y = element_blank(),
+          axis.ticks.y= element_blank(),
+          axis.text.y= element_blank(),
+          axis.title.y= element_blank())
+  
+  glm_plot<-p_1 + p_2 + p_3 + p_4 + plot_layout(design = layout)
+  
+  # Save linear regression plot
+  pdf(paste0("wgcna_adolescent/GLM_clean_plots/", data_name, "/", predictor, "_plot.pdf"), width = 13, height = 4)  
+  print(glm_plot)
+  dev.off()
+  
+  return(glm_plot)
+  
+}
+```
+
+# LR: All participants
+```{r}
+# Plot for heavyExpYN (heavy exposure binary variable) as the predictor for ME score
+glmplot_function_clean(data=all, predictor="heavyExpYN")
+# Plot for aaddxp (average ounces prenatal absolute alcohol per drinking occasion) as the predictor for ME score
+glmplot_function_clean(data=all, predictor="aaddxp")
+# Plot for pregnancy_drinking_perc (percent of days on which mother drank alcohol prenatally) as the predictor for ME score
+glmplot_function_clean(data=all, predictor="pregnancy_drinking_perc")
+```
+
+# LR: Males
+```{r}
+# Plot for heavyExpYN as the predictor for ME score
+glmplot_function_clean(data=male, predictor="heavyExpYN")
+# Plot for aaddxp as the predictor for ME score
+glmplot_function_clean(data=male, predictor="aaddxp")
+# Plot for pregnancy_drinking_perc as the predictor for ME score
+glmplot_function_clean(data=male, predictor="pregnancy_drinking_perc")
+```
+
+# LR: Females
+```{r}
+# Plot for heavyExpYN as the predictor for ME score
+glmplot_function_clean(data=female, predictor="heavyExpYN")
+# Plot for aaddxp as the predictor for ME score
+glmplot_function_clean(data=female, predictor="aaddxp")
+# Plot for pregnancy_drinking_perc as the predictor for ME score
+glmplot_function_clean(data=female, predictor="pregnancy_drinking_perc")
+```
+
+# Heatmap function for the effect size (covariates and covariates+cells)
+```{r}
+all <- read.csv("wgcna_adolescent/ModuleEigengenes_025_scores.csv") |>
+  select(-MEgrey)
+male <- all |> filter(sexr3 == 1)
+female <- all |> filter(sexr3 == 2)
+
+heatmap_function <- function(data) {
+  
+  MEs_long<-data%>%
+    dplyr::select(SID, starts_with("ME",ignore.case=FALSE), moage_t0, mograde, age2009clinic, RINe,
+                  Neutrophils, T.cells.CD4.memory.resting, NK.cells.activated, T.cells.CD8, B.cells.naive,
+                  Monocytes, T.cells.CD4.naive, Macrophages.M2, heavyExpYN, aaddxp, pregnancy_drinking_perc)%>%
+    pivot_longer(starts_with("ME",ignore.case=FALSE),names_to="Module",values_to="Score")
+  
+  # Covariates heatmap
+  
+  heavyExpYN_covs<-MEs_long%>%
+    nest(data=-c(Module))%>%
+    mutate(
+      test=map(data, ~lm(Score ~ factor(heavyExpYN) + moage_t0 + mograde + age2009clinic + RINe, data=.x)),
+      tidied=map(test, tidy, conf.int=TRUE)
+      ) %>%
+    unnest(tidied)%>%
+    mutate(predictor="heavyExpYN")%>%
+    filter(term=="factor(heavyExpYN)1")%>%
+    dplyr::select(Module, estimate, p.value, predictor)
+  
+  aaddxp_covs<-MEs_long%>%
+    nest(data=-c(Module))%>%
+    mutate(
+      test=map(data, ~lm(Score ~ aaddxp + moage_t0 + mograde + age2009clinic + RINe, data=.x)),
+      tidied=map(test, tidy, conf.int=TRUE)
+      ) %>%
+    unnest(tidied)%>%
+    mutate(predictor="aaddxp")%>%
+    filter(term=="aaddxp")%>%
+    dplyr::select(Module, estimate, p.value, predictor)
+  
+  pregnancy_drinking_perc_covs<-MEs_long%>%
+    nest(data=-c(Module))%>%
+    mutate(
+      test=map(data, ~lm(Score ~ pregnancy_drinking_perc + moage_t0 + mograde + age2009clinic + RINe, data=.x)),
+      tidied=map(test, tidy, conf.int=TRUE)
+      ) %>%
+    unnest(tidied)%>%
+    mutate(predictor="pregnancy_drinking_perc")%>%
+    filter(term=="pregnancy_drinking_perc")%>%
+    dplyr::select(Module, estimate, p.value, predictor)
+  
+  all_covs<-bind_rows(heavyExpYN_covs, aaddxp_covs, pregnancy_drinking_perc_covs)%>%
+    dplyr::select(Module, estimate, p.value, predictor)
+  
+  all_covs<-all_covs%>%
+    mutate(
+      star = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        TRUE ~ ""
+        ),
+      Module = str_remove(Module, "^ME"),
+      Module = recode(Module,
+                      yellow = "yellow (tRNA aminoacylation for protein translation)",
+                      tan = "tan (adenylate cyclase-modulating G protein-coupled receptor signaling pathway)",
+                      steelblue = "steelblue (RNA splicing, via transesterification reactions with bulged adenosine as nucleophile)",
+                      saddlebrown = "saddlebrown (protein K11-linked ubiquitination)",
+                      paleturquoise = "paleturquoise (IRE1-mediated unfolded protein response)",
+                      orange = "orange (mitotic spindle organization)",
+                      lightyellow = "lightyellow (regulation of immune response)",
+                      lightcyan = "lightcyan (defense response to virus)",
+                      grey60 = "grey60 (B cell receptor signaling pathway)",
+                      greenyellow = "greenyellow (SRP-dependent cotranslational protein targeting to membrane)",
+                      darkturquoise = "darkturquoise (receptor-mediated endocytosis)",
+                      darkred = "darkred (regulation of store-operated calcium entry)",
+                      darkorange = "darkorange (neutrophil activation involved in immune response)",
+                      darkgrey = "darkgrey (platelet degranulation)",
+                      darkgreen = "darkgreen (organelle organization)",
+                      blue = "blue (neutrophil mediated immunity)",
+                      black = "black (mRNA processing)"
+                      )
+      )
+  
+  covs_heatmap<-ggplot(all_covs, aes(x = predictor, y = Module, fill = estimate)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = star), color="black", size = 5) +
+    scale_fill_gradient2(
+      low = "#EDF8B1",
+      mid = "#7FCDBB",
+      high = "#2C7FB8",
+      midpoint = 0
+      ) +
+    theme_classic() +
+    theme(axis.title=element_blank(),
+          axis.text=element_text(size=11)) +
+    labs(fill=expression(paste(beta, " estimate"))) +
+    annotate("text", x = Inf, y = -Inf, label = "* p < 0.05\n** p < 0.01\n*** p < 0.001",
+             hjust = 0, vjust = -0.5) +
+    coord_cartesian(clip = "off")
+  
+  # Save the heatmap
+  data_name <- deparse(substitute(data))
+  pdf(paste0("wgcna_adolescent/GLM_clean_plots/", data_name, "/covs_heatmap.pdf"), width = 13, height = 4)
+  print(covs_heatmap)
+  dev.off()
+  
+  
+  # Covariates+Cells heatmap
+  
+  heavyExpYN_covscells<-MEs_long%>%
+    nest(data=-c(Module))%>%
+    mutate(
+      test=map(data, ~lm(Score ~ factor(heavyExpYN) + moage_t0 + mograde + age2009clinic + RINe + 
+                           Neutrophils + T.cells.CD4.memory.resting + NK.cells.activated + 
+                           T.cells.CD8 + B.cells.naive + Monocytes + T.cells.CD4.naive + Macrophages.M2,
+                         data=.x)),
+      tidied=map(test, tidy, conf.int=TRUE)
+      ) %>%
+    unnest(tidied)%>%
+    mutate(predictor="heavyExpYN")%>%
+    filter(term=="factor(heavyExpYN)1")%>%
+    dplyr::select(Module, estimate, p.value, predictor)
+  
+  aaddxp_covscells<-MEs_long%>%
+    nest(data=-c(Module))%>%
+    mutate(
+      test=map(data, ~lm(Score ~ aaddxp + moage_t0 + mograde + age2009clinic + RINe +
+                           Neutrophils + T.cells.CD4.memory.resting + NK.cells.activated + 
+                           T.cells.CD8 + B.cells.naive + Monocytes + T.cells.CD4.naive + Macrophages.M2,
+                         data=.x)),
+      tidied=map(test, tidy, conf.int=TRUE)
+      ) %>%
+    unnest(tidied)%>%
+    mutate(predictor="aaddxp")%>%
+    filter(term=="aaddxp")%>%
+    dplyr::select(Module, estimate, p.value, predictor)
+  
+  pregnancy_drinking_perc_covscells<-MEs_long%>%
+    nest(data=-c(Module))%>%
+    mutate(
+      test=map(data, ~lm(Score ~ pregnancy_drinking_perc + moage_t0 + mograde + age2009clinic + RINe +
+                           Neutrophils + T.cells.CD4.memory.resting + NK.cells.activated + 
+                           T.cells.CD8 + B.cells.naive + Monocytes + T.cells.CD4.naive + Macrophages.M2,
+                         data=.x)),
+      tidied=map(test, tidy, conf.int=TRUE)
+      ) %>%
+    unnest(tidied)%>%
+    mutate(predictor="pregnancy_drinking_perc")%>%
+    filter(term=="pregnancy_drinking_perc")%>%
+    dplyr::select(Module, estimate, p.value, predictor)
+  
+  all_covscells<-bind_rows(heavyExpYN_covscells, aaddxp_covscells, pregnancy_drinking_perc_covscells)%>%
+    dplyr::select(Module, estimate, p.value, predictor)
+  
+  all_covscells<-all_covscells%>%
+    mutate(
+      star = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        TRUE ~ ""
+        ),
+      Module = str_remove(Module, "^ME"),
+      Module = recode(Module,
+                      yellow = "yellow (tRNA aminoacylation for protein translation)",
+                      tan = "tan (adenylate cyclase-modulating G protein-coupled receptor signaling pathway)",
+                      steelblue = "steelblue (RNA splicing, via transesterification reactions with bulged adenosine as nucleophile)",
+                      saddlebrown = "saddlebrown (protein K11-linked ubiquitination)",
+                      paleturquoise = "paleturquoise (IRE1-mediated unfolded protein response)",
+                      orange = "orange (mitotic spindle organization)",
+                      lightyellow = "lightyellow (regulation of immune response)",
+                      lightcyan = "lightcyan (defense response to virus)",
+                      grey60 = "grey60 (B cell receptor signaling pathway)",
+                      greenyellow = "greenyellow (SRP-dependent cotranslational protein targeting to membrane)",
+                      darkturquoise = "darkturquoise (receptor-mediated endocytosis)",
+                      darkred = "darkred (regulation of store-operated calcium entry)",
+                      darkorange = "darkorange (neutrophil activation involved in immune response)",
+                      darkgrey = "darkgrey (platelet degranulation)",
+                      darkgreen = "darkgreen (organelle organization)",
+                      blue = "blue (neutrophil mediated immunity)",
+                      black = "black (mRNA processing)"
+                      )
+      )
+  
+  covscells_heatmap<-ggplot(all_covscells, aes(x = predictor, y = Module, fill = estimate)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = star), color="black", size = 5) +
+    scale_fill_gradient2(
+      low = "#EDF8B1",
+      mid = "#7FCDBB",
+      high = "#2C7FB8",
+      midpoint = 0
+      ) +
+    theme_classic() +
+    theme(axis.title=element_blank(),
+          axis.text=element_text(size=11)) +
+    labs(fill=expression(paste(beta, " estimate"))) +
+    annotate("text", x = Inf, y = -Inf, label = "* p < 0.05\n** p < 0.01\n*** p < 0.001",
+             hjust = 0, vjust = -0.5) +
+    coord_cartesian(clip = "off")
+  
+  # Save the heatmap
+  pdf(paste0("wgcna_adolescent/GLM_clean_plots/", data_name, "/covscells_heatmap.pdf"), width = 13, height = 4)
+  print(covscells_heatmap)
+  dev.off()
+}
+```
+
+# Heatmaps for all, females, and males
+```{r}
+# All participants
+heatmap_function(data=all)
+# Females
+heatmap_function(data=female)
+# Males
+heatmap_function(data=male)
+```
+
+# Table for interaction term between sex and alcohol variables with p-values
+```{r}
+all <- read.csv("wgcna_adolescent/ModuleEigengenes_025_scores.csv")%>%
+  select(-MEgrey)
+
+MEs_long<-all%>%
+  dplyr::select(SID, starts_with("ME",ignore.case=FALSE), moage_t0, mograde, age2009clinic, RINe, sexr3,
+                Neutrophils, T.cells.CD4.memory.resting, NK.cells.activated, T.cells.CD8, B.cells.naive,
+                Monocytes, T.cells.CD4.naive, Macrophages.M2, heavyExpYN, aaddxp, pregnancy_drinking_perc)%>%
+  pivot_longer(starts_with("ME",ignore.case=FALSE),names_to="Module",values_to="Score")
+
+# Covariates
+
+heavyExpYN_covsinter<-MEs_long%>%
+  nest(data=-c(Module))%>%
+  mutate(
+    test=map(data, ~lm(Score ~ factor(heavyExpYN) + moage_t0 + mograde + age2009clinic + RINe +
+                         factor(heavyExpYN)*sexr3, data=.x)),
+    tidied=map(test, tidy, conf.int=TRUE)
+    ) %>%
+  unnest(tidied)%>%
+  mutate(predictor="heavyExpYN")%>%
+  filter(term=="factor(heavyExpYN)1:sexr3")%>%
+  dplyr::select(Module, p.value, predictor)
+
+aaddxp_covsinter<-MEs_long%>%
+  nest(data=-c(Module))%>%
+  mutate(
+    test=map(data, ~lm(Score ~ aaddxp + moage_t0 + mograde + age2009clinic + RINe + 
+                         aaddxp*sexr3, data=.x)),
+    tidied=map(test, tidy, conf.int=TRUE)
+    ) %>%
+  unnest(tidied)%>%
+  mutate(predictor="aaddxp")%>%
+  filter(term=="aaddxp:sexr3")%>%
+  dplyr::select(Module, p.value, predictor)
+
+pregnancy_drinking_perc_covsinter<-MEs_long%>%
+  nest(data=-c(Module))%>%
+  mutate(
+    test=map(data, ~lm(Score ~ pregnancy_drinking_perc + moage_t0 + mograde + age2009clinic + RINe +
+                         pregnancy_drinking_perc*sexr3, data=.x)),
+    tidied=map(test, tidy, conf.int=TRUE)
+    ) %>%
+  unnest(tidied)%>%
+  mutate(predictor="pregnancy_drinking_perc")%>%
+  filter(term=="pregnancy_drinking_perc:sexr3")%>%
+  dplyr::select(Module, p.value, predictor)
+  
+all_covsinter<-bind_rows(heavyExpYN_covsinter, aaddxp_covsinter, pregnancy_drinking_perc_covsinter)%>%
+  pivot_wider(
+    names_from = predictor,
+    values_from = p.value
+  )
+
+gt(all_covsinter) %>%
+  data_color(
+    columns = everything(),
+    fn = function(x) {
+      ifelse(x < 0.05, "red", "white")
+      }
+    )
+
+# Covariates+Cells
+
+heavyExpYN_covscellsinter<-MEs_long%>%
+  nest(data=-c(Module))%>%
+  mutate(
+    test=map(data, ~lm(Score ~ factor(heavyExpYN) + moage_t0 + mograde + age2009clinic + RINe + 
+                         Neutrophils + T.cells.CD4.memory.resting + NK.cells.activated + 
+                         T.cells.CD8 + B.cells.naive + Monocytes + T.cells.CD4.naive + Macrophages.M2 +
+                         factor(heavyExpYN)*sexr3,data=.x)),
+    tidied=map(test, tidy, conf.int=TRUE)
+    ) %>%
+  unnest(tidied)%>%
+  mutate(predictor="heavyExpYN")%>%
+  filter(term=="factor(heavyExpYN)1:sexr3")%>%
+  dplyr::select(Module, p.value, predictor)
+
+aaddxp_covscellsinter<-MEs_long%>%
+  nest(data=-c(Module))%>%
+  mutate(
+    test=map(data, ~lm(Score ~ aaddxp + moage_t0 + mograde + age2009clinic + RINe +
+                         Neutrophils + T.cells.CD4.memory.resting + NK.cells.activated + 
+                         T.cells.CD8 + B.cells.naive + Monocytes + T.cells.CD4.naive + Macrophages.M2 + 
+                         aaddxp*sexr3, data=.x)),
+    tidied=map(test, tidy, conf.int=TRUE)
+    ) %>%
+  unnest(tidied)%>%
+  mutate(predictor="aaddxp")%>%
+  filter(term=="aaddxp:sexr3")%>%
+  dplyr::select(Module, p.value, predictor)
+  
+pregnancy_drinking_perc_covscellsinter<-MEs_long%>%
+  nest(data=-c(Module))%>%
+  mutate(
+    test=map(data, ~lm(Score ~ pregnancy_drinking_perc + moage_t0 + mograde + age2009clinic + RINe +
+                         Neutrophils + T.cells.CD4.memory.resting + NK.cells.activated + 
+                         T.cells.CD8 + B.cells.naive + Monocytes + T.cells.CD4.naive + Macrophages.M2 +
+                         pregnancy_drinking_perc*sexr3, data=.x)),
+    tidied=map(test, tidy, conf.int=TRUE)
+    ) %>%
+  unnest(tidied)%>%
+  mutate(predictor="pregnancy_drinking_perc")%>%
+  filter(term=="pregnancy_drinking_perc:sexr3")%>%
+  dplyr::select(Module, p.value, predictor)
+  
+all_covscellsinter<-bind_rows(heavyExpYN_covscellsinter, aaddxp_covscellsinter,
+                              pregnancy_drinking_perc_covscellsinter)%>%
+  pivot_wider(
+    names_from = predictor,
+    values_from = p.value
+    )
+
+gt(all_covscellsinter) %>%
+  data_color(
+    columns = everything(),
+    fn = function(x) {
+      ifelse(x < 0.05, "red", "white")
+      }
+    )
+```
+
+# Clean LR plots with sex function
+```{r}
+layout <- c(
+  area(t = 0, l = 0,  b = 30, r = 12),
+  area(t = 0, l = 13,  b = 30, r = 18),
+  area(t = 0, l = 19, b = 30, r = 24)
+)
+
+glmplot_function_sex <- function(predictor, sex_modules_covs, sex_modules_covscells) {
+  
+  data <- read.csv("wgcna_adolescent/ModuleEigengenes_025_scores.csv") %>%
+    select(-MEgrey)
+  
+  MEs_long <- data %>%
+    dplyr::select(SID, starts_with("ME", ignore.case = FALSE), moage_t0, mograde, age2009clinic, 
+                  RINe, Neutrophils, T.cells.CD4.memory.resting, NK.cells.activated, T.cells.CD8,
+                  B.cells.naive, Monocytes, T.cells.CD4.naive, Macrophages.M2, sexr3,
+                  all_of(predictor)) %>%
+    pivot_longer(starts_with("ME", ignore.case = FALSE), names_to = "Module", values_to = "Score")
+  
+  run_models <- function(dat, sex_label) {
+    
+    binary <- is.factor(dat[[predictor]]) &&
+      length(levels(dat[[predictor]])) == 2
+    
+    if (binary) {
+      formula_covs <- as.formula(
+        paste("Score ~ factor(", predictor, ") + moage_t0 + mograde + age2009clinic + RINe"))
+      formula_covscells <- as.formula(
+        paste("Score ~ factor(", predictor, ") + moage_t0 + mograde + age2009clinic + RINe", 
+              "+ Neutrophils", "+ T.cells.CD4.memory.resting", "+ NK.cells.activated",
+              "+ T.cells.CD8", "+ B.cells.naive", "+ Monocytes", "+ T.cells.CD4.naive",
+              "+ Macrophages.M2"))
+      filter_predictor <- paste0("factor(", predictor, ")1")
+    } else {
+      formula_covs <- as.formula(
+        paste("Score ~", predictor, "+ moage_t0 + mograde + age2009clinic + RINe"))
+      formula_covscells <- as.formula(
+        paste("Score ~", predictor, "+ moage_t0 + mograde + age2009clinic + RINe", 
+              "+ Neutrophils", "+ T.cells.CD4.memory.resting", "+ NK.cells.activated",
+              "+ T.cells.CD8", "+ B.cells.naive", "+ Monocytes", "+ T.cells.CD4.naive",
+              "+ Macrophages.M2"))
+      filter_predictor <- predictor
+    }
+    
+    glm_covs <- dat %>%
+      nest(data = -Module) %>%
+      mutate(test = map(data, ~ lm(formula_covs, data = .x)), 
+             tidied = map(test, ~ tidy(.x, conf.int = TRUE))) %>%
+      unnest(tidied) %>%
+      mutate(model = "glm_covs", sex = sex_label)
+    
+    
+    glm_covs_predictor <- glm_covs %>%
+      filter(term == filter_predictor) %>%
+      dplyr::select(Module, estimate, std.error, statistic, p.value, conf.low,conf.high, model, sex)
+    
+    glm_covscells <- dat %>%
+      nest(data = -Module) %>%
+      mutate(test = map(data, ~ lm(formula_covscells, data = .x)),
+             tidied = map(test, ~ tidy(.x, conf.int = TRUE))) %>%
+      unnest(tidied) %>%
+      mutate(model = "glm_covscells", sex = sex_label)
+    
+    
+    glm_covscells_predictor <- glm_covscells %>%
+      filter(term == filter_predictor) %>%
+      dplyr::select(Module, estimate, std.error, statistic, p.value, conf.low, conf.high, model, sex)
+    
+    list(covs = glm_covs_predictor, covscells = glm_covscells_predictor)
+    
+  }
+  
+  all_results <- run_models(MEs_long, "All")
+  
+  female_results <- run_models(MEs_long %>% 
+                                 filter(sexr3 == 2), "Female")
+  
+  male_results <- run_models(MEs_long %>%
+                               filter(sexr3 == 1), "Male")
+  
+  covs_all <- bind_rows(all_results$covs, female_results$covs, male_results$covs)
+  
+  covscells_all <- bind_rows(all_results$covscells, female_results$covscells, male_results$covscells)
+  
+  covs_plot <- covs_all %>%
+    mutate(Module = str_remove(Module, "^ME")) %>%
+    filter(sex == "All" | (sex %in% c("Female", "Male") & Module %in% sex_modules_covs)) %>%
+    mutate(Module = recode(Module,
+                           yellow = "yellow (tRNA aminoacylation for protein translation)",
+                           tan = "tan (adenylate cyclase-modulating G protein-coupled receptor signaling pathway)",
+                           steelblue = "steelblue (RNA splicing, via transesterification reactions with bulged adenosine as nucleophile)",
+                           saddlebrown = "saddlebrown (protein K11-linked ubiquitination)",
+                           paleturquoise = "paleturquoise (IRE1-mediated unfolded protein response)",
+                           orange = "orange (mitotic spindle organization)",
+                           lightyellow = "lightyellow (regulation of immune response)",
+                           lightcyan = "lightcyan (defense response to virus)",
+                           grey60 = "grey60 (B cell receptor signaling pathway)",
+                           greenyellow = "greenyellow (SRP-dependent cotranslational protein targeting to membrane)",
+                           darkturquoise = "darkturquoise (receptor-mediated endocytosis)",
+                           darkred = "darkred (regulation of store-operated calcium entry)",
+                           darkorange = "darkorange (neutrophil activation involved in immune response)",
+                           darkgrey = "darkgrey (platelet degranulation)",
+                           darkgreen = "darkgreen (organelle organization)",
+                           blue = "blue (neutrophil mediated immunity)",
+                           black = "black (mRNA processing)"
+                           ))
+  
+  covscells_plot <- covscells_all %>%
+    mutate(Module = str_remove(Module, "^ME")) %>%
+    filter(sex == "All" | (sex %in% c("Female", "Male") & Module %in% sex_modules_covscells)) %>%
+    mutate(Module = recode(Module,
+                           yellow = "yellow (tRNA aminoacylation for protein translation)",
+                           tan = "tan (adenylate cyclase-modulating G protein-coupled receptor signaling pathway)",
+                           steelblue = "steelblue (RNA splicing, via transesterification reactions with bulged adenosine as nucleophile)",
+                           saddlebrown = "saddlebrown (protein K11-linked ubiquitination)",
+                           paleturquoise = "paleturquoise (IRE1-mediated unfolded protein response)",
+                           orange = "orange (mitotic spindle organization)",
+                           lightyellow = "lightyellow (regulation of immune response)",
+                           lightcyan = "lightcyan (defense response to virus)",
+                           grey60 = "grey60 (B cell receptor signaling pathway)",
+                           greenyellow = "greenyellow (SRP-dependent cotranslational protein targeting to membrane)",
+                           darkturquoise = "darkturquoise (receptor-mediated endocytosis)",
+                           darkred = "darkred (regulation of store-operated calcium entry)",
+                           darkorange = "darkorange (neutrophil activation involved in immune response)",
+                           darkgrey = "darkgrey (platelet degranulation)",
+                           darkgreen = "darkgreen (organelle organization)",
+                           blue = "blue (neutrophil mediated immunity)",
+                           black = "black (mRNA processing)"
+                           ))
+  
+  p_1 <- covs_plot %>%
+    filter(sex == "All") %>%
+    ggplot(aes(y = Module)) +
+    geom_text(aes(x = 0, label = Module), hjust = 0, fontface = "plain",size = 3.5) +
+    labs(title = "Module") +
+    theme_void() +
+    coord_cartesian(xlim = c(0, 4))
+  
+  p_2 <- covs_plot %>%
+    filter(Module != "Module") %>%
+    ggplot(aes(y = Module, color = sex, shape = sex)) +
+    geom_linerange(aes(xmin = conf.low, xmax = conf.high), linewidth = 0.8) +
+    geom_point(aes(x = estimate), size = 3) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    scale_color_manual(values = c("All" = scales::alpha("black", 0.75),
+                                  "Female" = scales::alpha("pink", 0.75),
+                                  "Male" = scales::alpha("lightblue", 0.75))) +
+    scale_shape_manual(values = c("All" = 15, "Female" = 15, "Male" = 15)) +
+    theme_classic() +
+    labs(title = paste0("Covariates ", intToUtf8(0x03B2), " (95% CI)"),
+         x = expression(paste(beta, " estimate")), y = "", color = "", shape = "") +
+    theme(axis.line.y = element_blank(), axis.ticks.y = element_blank(),
+          axis.text.y = element_blank(), axis.title.y = element_blank())
+  
+  p_3 <- covscells_plot %>%
+    filter(Module != "Module") %>%
+    ggplot(aes(y = Module, color = sex, shape = sex)) +
+    geom_linerange(aes(xmin = conf.low, xmax = conf.high), linewidth = 0.8) +
+    geom_point(aes(x = estimate), size = 3) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    scale_color_manual(values = c("All" = scales::alpha("black", 0.75), 
+                                  "Female" = scales::alpha("pink", 0.75),
+                                  "Male" = scales::alpha("lightblue", 0.75))) +
+    scale_shape_manual(values = c("All" = 15, "Female" = 15, "Male" = 15)) +
+    theme_classic() +
+    labs(title = paste0("Covariates+Cells ", intToUtf8(0x03B2), " (95% CI)"),
+         x = expression(paste(beta, " estimate")), y = "", color = "", shape = "") +
+    theme(axis.line.y = element_blank(), axis.ticks.y = element_blank(), 
+          axis.text.y = element_blank(), axis.title.y = element_blank())
+  
+  glm_plot <- p_1 + p_2 + p_3 + plot_layout(design = layout, guides = "collect") &
+    theme(legend.position = "bottom")
+  
+  # Save linear regression plot
+  pdf(paste0("wgcna_adolescent/GLM_clean_plots_sex/", predictor, "_plot.pdf"), width = 13, height = 4)  
+  print(glm_plot)
+  dev.off()
+  
+  return(glm_plot)
+  
+}
+```
+
+# LR: All participants
+```{r}
+# Plot for heavyExpYN as the predictor for ME score
+glmplot_function_sex(predictor="heavyExpYN", sex_modules_covs=c("paleturquoise"), sex_modules_covscells=c("saddlebrown", "paleturquoise", "lightyellow", "blue"))
+# Plot for aaddxp as the predictor for ME score
+glmplot_function_sex(predictor="aaddxp", sex_modules_covs=c("paleturquoise"), sex_modules_covscells=c("paleturquoise", "lightyellow", "blue"))
+# Plot for pregnancy_drinking_perc as the predictor for ME score
+glmplot_function_sex(predictor="pregnancy_drinking_perc", sex_modules_covs=c("paleturquoise", "lightyellow"), sex_modules_covscells=c("paleturquoise", "lightyellow"))
+```
+
+# Final verson: LR plots with sex function
+```{r}
+layout <- c(
+  area(t = 0, l = 0,  b = 30, r = 12),
+  area(t = 0, l = 13,  b = 30, r = 18)
+)
+
+glmplot_function_sex <- function(predictor, sex_modules_covscells) {
+  
+  data <- read.csv("wgcna_adolescent/ModuleEigengenes_025_scores.csv") %>%
+    select(-MEgrey)
+  
+  MEs_long <- data %>%
+    dplyr::select(SID, starts_with("ME", ignore.case = FALSE), moage_t0, mograde, age2009clinic, 
+                  RINe, Neutrophils, T.cells.CD4.memory.resting, NK.cells.activated, T.cells.CD8,
+                  B.cells.naive, Monocytes, T.cells.CD4.naive, Macrophages.M2, sexr3,
+                  all_of(predictor)) %>%
+    pivot_longer(starts_with("ME", ignore.case = FALSE), names_to = "Module", values_to = "Score")
+  
+  run_models <- function(dat, sex_label) {
+    
+    binary <- is.factor(dat[[predictor]]) &&
+      length(levels(dat[[predictor]])) == 2
+    
+    if (binary) {
+      formula_covscells <- as.formula(
+        paste("Score ~ factor(", predictor, ") + moage_t0 + mograde + age2009clinic + RINe", 
+              "+ Neutrophils", "+ T.cells.CD4.memory.resting", "+ NK.cells.activated",
+              "+ T.cells.CD8", "+ B.cells.naive", "+ Monocytes", "+ T.cells.CD4.naive",
+              "+ Macrophages.M2"))
+      filter_predictor <- paste0("factor(", predictor, ")1")
+    } else {
+      formula_covscells <- as.formula(
+        paste("Score ~", predictor, "+ moage_t0 + mograde + age2009clinic + RINe", 
+              "+ Neutrophils", "+ T.cells.CD4.memory.resting", "+ NK.cells.activated",
+              "+ T.cells.CD8", "+ B.cells.naive", "+ Monocytes", "+ T.cells.CD4.naive",
+              "+ Macrophages.M2"))
+      filter_predictor <- predictor
+    }
+    
+    glm_covscells <- dat %>%
+      nest(data = -Module) %>%
+      mutate(test = map(data, ~ lm(formula_covscells, data = .x)),
+             tidied = map(test, ~ tidy(.x, conf.int = TRUE))) %>%
+      unnest(tidied) %>%
+      mutate(model = "glm_covscells", sex = sex_label)
+    
+    
+    glm_covscells_predictor <- glm_covscells %>%
+      filter(term == filter_predictor) %>%
+      dplyr::select(Module, estimate, std.error, statistic, p.value, conf.low, conf.high, model, sex)
+    
+    list(covscells = glm_covscells_predictor)
+    
+  }
+  
+  all_results <- run_models(MEs_long, "All")
+  
+  female_results <- run_models(MEs_long %>% 
+                                 filter(sexr3 == 2), "Female")
+  
+  male_results <- run_models(MEs_long %>%
+                               filter(sexr3 == 1), "Male")
+  
+  covscells_all <- bind_rows(all_results$covscells, female_results$covscells, male_results$covscells)
+  
+  covscells_plot <- covscells_all %>%
+    mutate(Module = str_remove(Module, "^ME")) %>%
+    filter(sex == "All" | (sex %in% c("Female", "Male") & Module %in% sex_modules_covscells)) %>%
+    mutate(Module = recode(Module,
+                           yellow = "yellow (tRNA aminoacylation for protein translation)",
+                           tan = "tan (adenylate cyclase-modulating G protein-coupled receptor signaling pathway)",
+                           steelblue = "steelblue (RNA splicing, via transesterification reactions with bulged adenosine as nucleophile)",
+                           saddlebrown = "saddlebrown (protein K11-linked ubiquitination)",
+                           paleturquoise = "paleturquoise (IRE1-mediated unfolded protein response)",
+                           orange = "orange (mitotic spindle organization)",
+                           lightyellow = "lightyellow (regulation of immune response)",
+                           lightcyan = "lightcyan (defense response to virus)",
+                           grey60 = "grey60 (B cell receptor signaling pathway)",
+                           greenyellow = "greenyellow (SRP-dependent cotranslational protein targeting to membrane)",
+                           darkturquoise = "darkturquoise (receptor-mediated endocytosis)",
+                           darkred = "darkred (regulation of store-operated calcium entry)",
+                           darkorange = "darkorange (neutrophil activation involved in immune response)",
+                           darkgrey = "darkgrey (platelet degranulation)",
+                           darkgreen = "darkgreen (organelle organization)",
+                           blue = "blue (neutrophil mediated immunity)",
+                           black = "black (mRNA processing)"
+                           ))
+  
+  p_1 <- covscells_plot %>%
+    filter(sex == "All") %>%
+    ggplot(aes(y = Module)) +
+    geom_text(aes(x = 0, label = Module), hjust = 0, fontface = "plain",size = 3.5) +
+    labs(title = "Module") +
+    theme_void() +
+    coord_cartesian(xlim = c(0, 4))
+  
+  p_2 <- covscells_plot %>%
+    filter(Module != "Module") %>%
+    ggplot(aes(y = Module, color = sex, shape = sex)) +
+    geom_linerange(aes(xmin = conf.low, xmax = conf.high), linewidth = 0.8) +
+    geom_point(aes(x = estimate), size = 3) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    scale_color_manual(values = c("All" = scales::alpha("black", 0.75),
+                                  "Female" = scales::alpha("pink", 0.75),
+                                  "Male" = scales::alpha("lightblue", 0.75))) +
+    scale_shape_manual(values = c("All" = 15, "Female" = 15, "Male" = 15)) +
+    theme_classic() +
+    labs(title = paste0("Covariates ", intToUtf8(0x03B2), " (95% CI)"),
+         x = expression(paste(beta, " estimate")), y = "", color = "", shape = "") +
+    theme(axis.line.y = element_blank(), axis.ticks.y = element_blank(),
+          axis.text.y = element_blank(), axis.title.y = element_blank())
+  
+  glm_plot <- p_1 + p_2 + plot_layout(design = layout, guides = "collect") &
+    theme(legend.position = "bottom")
+  
+  # Save linear regression plot
+  pdf(paste0("wgcna_adolescent/GLM_clean_plots_sex/", predictor, "_finalplot.pdf"), width = 10, height = 4)  
+  print(glm_plot)
+  dev.off()
+  
+  return(glm_plot)
+  
+}
+```
+
+# LR: All participants
+```{r}
+# Plot for heavyExpYN as the predictor for ME score
+glmplot_function_sex(predictor="heavyExpYN", sex_modules_covscells=c("saddlebrown", "paleturquoise", "lightyellow", "blue"))
+# Plot for aaddxp as the predictor for ME score
+glmplot_function_sex(predictor="aaddxp", sex_modules_covscells=c("paleturquoise", "lightyellow", "blue"))
+# Plot for pregnancy_drinking_perc as the predictor for ME score
+glmplot_function_sex(predictor="pregnancy_drinking_perc", sex_modules_covscells=c("paleturquoise", "lightyellow"))
+```
+
+
+
